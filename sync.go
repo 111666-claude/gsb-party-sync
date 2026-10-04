@@ -1,6 +1,4 @@
 // Package partysync 是队伍状态版本向量：逐成员序号、幂等应用、乱序暂存补洞、差异检测与修复。
-// 缺陷：应用不幂等、旧序号会覆盖新状态、跳号直接接受、差异检测拿全局最大序号比较、
-// 落后方向也报全部成员、每次应用都扫全部历史。
 package partysync
 
 import "sort"
@@ -14,17 +12,10 @@ type Member struct {
 	State map[string]string
 }
 
-type entry struct {
-	member string
-	seq    int
-	state  map[string]string
-}
-
 // Sync 是队伍状态同步台账。
 type Sync struct {
 	members  map[string]Member
 	buffered map[string]map[int]map[string]string
-	log      []entry
 	scanned  int
 }
 
@@ -46,11 +37,36 @@ func clone(state map[string]string) map[string]string {
 
 // Apply 应用某个成员的一次状态更新，返回这次更新是否当场生效。
 func (s *Sync) Apply(member string, seq int, state map[string]string) bool {
-	for range s.log {
-		s.scanned++
+	current := s.members[member].Seq
+	if seq <= current {
+		return false
 	}
-	s.log = append(s.log, entry{member: member, seq: seq, state: state})
+	if _, ok := s.members[member]; !ok {
+		s.members[member] = Member{Seq: seq, State: clone(state)}
+		return true
+	}
+	if seq > current+1 {
+		pending, ok := s.buffered[member]
+		if !ok {
+			pending = map[int]map[string]string{}
+			s.buffered[member] = pending
+		}
+		pending[seq] = clone(state)
+		return false
+	}
 	s.members[member] = Member{Seq: seq, State: clone(state)}
+	for {
+		next, ok := s.buffered[member][seq+1]
+		if !ok {
+			break
+		}
+		seq++
+		s.members[member] = Member{Seq: seq, State: next}
+		delete(s.buffered[member], seq)
+	}
+	if len(s.buffered[member]) == 0 {
+		delete(s.buffered, member)
+	}
 	return true
 }
 
@@ -73,23 +89,11 @@ func (s *Sync) Pending(member string) int { return len(s.buffered[member]) }
 
 // Diff 返回本地比对端新的成员，按名字升序。
 func (s *Sync) Diff(peer Vector) []string {
-	mine, theirs := 0, 0
-	for _, seq := range s.Version() {
-		if seq > mine {
-			mine = seq
-		}
-	}
-	for _, seq := range peer {
-		if seq > theirs {
-			theirs = seq
-		}
-	}
-	if mine <= theirs {
-		return []string{}
-	}
 	out := []string{}
-	for name := range s.members {
-		out = append(out, name)
+	for name, item := range s.members {
+		if item.Seq > peer[name] {
+			out = append(out, name)
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -97,23 +101,11 @@ func (s *Sync) Diff(peer Vector) []string {
 
 // Missing 返回本地比对端落后的成员，按名字升序。
 func (s *Sync) Missing(peer Vector) []string {
-	mine, theirs := 0, 0
-	for _, seq := range s.Version() {
-		if seq > mine {
-			mine = seq
-		}
-	}
-	for _, seq := range peer {
-		if seq > theirs {
-			theirs = seq
-		}
-	}
-	if theirs <= mine {
-		return []string{}
-	}
 	out := []string{}
-	for name := range peer {
-		out = append(out, name)
+	for name, seq := range peer {
+		if seq > s.members[name].Seq {
+			out = append(out, name)
+		}
 	}
 	sort.Strings(out)
 	return out
